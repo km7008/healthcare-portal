@@ -21,4 +21,3 @@ frontend/.env.local
 Thumbs.db
 
 # Exclude Voice Feature File
-backend/routers/transcribe.py
