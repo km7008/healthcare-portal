@@ -626,7 +626,7 @@ export default function DashboardLayout({ children }) {
           </Link>
 
           <button
-            onClick={handle}
+            onClick={handleLogout}
             className="bg-white/20 border-none text-white px-3.5 py-2 rounded-lg cursor-pointer "
           >
             Log Out

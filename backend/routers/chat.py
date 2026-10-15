@@ -732,7 +732,7 @@ def ask_ai(
         data = response.json()
 
         text_out = data["choices"][0]["message"]["content"].strip()
-        print("AI said:", text_out[:200])
+        
 
         if text_out == "NOT_FOUND":
             return None
