@@ -1,64 +1,45 @@
+
+import asyncio
 import logging
 import os
+import tempfile
+import threading
 
-import httpx
-from dotenv import load_dotenv
+import whisper
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 import models
 from auth import get_current_user
 
-load_dotenv()  
-
 logger = logging.getLogger("uvicorn.error")
-
 router = APIRouter(tags=["transcribe"])
-
-HF_ASR_MODELS = [
-    "openai/whisper-large-v3-turbo",
-    "openai/whisper-large-v3",
-]
-HF_ASR_BASE = "https://router.huggingface.co/hf-inference/models/"
 
 MAX_AUDIO_BYTES = 5 * 1024 * 1024  # 5 MB
 
+_whisper_model = None
+_model_lock = threading.Lock()
 
-def _get_token() -> str:
-    for name in (
-        "HF_TOKEN",
-        "HF_API_TOKEN",
-        "HUGGINGFACE_TOKEN",
-        "HUGGINGFACEHUB_API_TOKEN",
-    ):
-        value = os.getenv(name, "").strip()
 
-        if value:
-            return value
+def _get_local_model():
+    global _whisper_model
 
-    return ""
+    if _whisper_model is None:
+        with _model_lock:
+            if _whisper_model is None:
+                logger.info("Loading local Whisper base model...")
+                _whisper_model = whisper.load_model("base")
+                logger.info("Local Whisper model loaded successfully.")
+
+    return _whisper_model
+
+
+def _transcribe_local_file(file_path: str) -> str:
+    model = _get_local_model()
+    result = model.transcribe(file_path)
+    return (result.get("text") or "").strip()
 
 
 async def _transcribe(file: UploadFile) -> dict:
-    token = _get_token()
-
-    if not token:
-        similar = [
-            k
-            for k in os.environ
-            if "HF" in k.upper() or "HUGGING" in k.upper()
-        ]
-
-        logger.error(
-            "Voice: no Hugging Face token found. Add HF_TOKEN=hf_xxx to "
-            "backend/.env and restart the backend. "
-            "Similar variable names found: %s",
-            similar or "none",
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="Voice transcription is not configured (HF_TOKEN missing)",
-        )
-
     audio = await file.read()
 
     if not audio:
@@ -67,59 +48,37 @@ async def _transcribe(file: UploadFile) -> dict:
     if len(audio) > MAX_AUDIO_BYTES:
         raise HTTPException(status_code=400, detail="Audio file is too large")
 
-    content_type = (file.content_type or "audio/webm").split(";")[0]
+    content_type = (file.content_type or "").lower()
+    suffix = ".mp4" if "mp4" in content_type else ".webm"
+    temp_path = None
 
-    last_status = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix, delete=False
+        ) as temp_file:
+            temp_file.write(audio)
+            temp_path = temp_file.name
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(90.0, connect=10.0)
-    ) as client:
-        for model in HF_ASR_MODELS:
-            try:
-                response = await client.post(
-                    HF_ASR_BASE + model,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": content_type,
-                        "x-wait-for-model": "true",
-                    },
-                    content=audio,
-                )
-            except httpx.HTTPError as exc:
-                logger.warning("Voice: %s request failed: %r", model, exc)
-                continue
+        text = await asyncio.to_thread(
+            _transcribe_local_file, temp_path
+        )
 
-            last_status = response.status_code
+        logger.info("Local Whisper transcribed %d characters", len(text))
+        return {"text": text}
 
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                except ValueError:
-                    logger.warning(
-                        "Voice: %s returned a non-JSON answer", model
-                    )
-                    continue
+    except HTTPException:
+        raise
 
-                text = ""
+    except Exception as exc:
+        logger.exception("Local Whisper transcription failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Local voice transcription failed. Check backend logs.",
+        ) from exc
 
-                if isinstance(data, dict):
-                    text = (data.get("text") or "").strip()
-
-                logger.info("Voice: %s understood %d characters", model, len(text))
-
-                return {"text": text}
-
-            logger.warning(
-                "Voice: %s -> HTTP %s %s",
-                model,
-                response.status_code,
-                response.text[:300],
-            )
-
-    raise HTTPException(
-        status_code=502,
-        detail=f"Transcription failed (Hugging Face status {last_status})",
-    )
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 @router.post("/chat/transcribe")
@@ -128,7 +87,6 @@ async def transcribe_audio(
     current_user: models.User = Depends(get_current_user),
 ):
     return await _transcribe(file)
-
 
 
 @router.post("/chat/public/transcribe")
